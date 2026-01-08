@@ -80,6 +80,7 @@ import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { auth, db } from '../lib/api';
 import { wsDecryptionService } from '../lib/wsDecryptionService';
+import { getSessionManager } from '../lib/sessionManager';
 
 export default {
   name: 'Header',
@@ -145,8 +146,16 @@ export default {
 
     const handleLogout = async () => {
       userDropdownOpen.value = false;
+
+      // Stop session manager
+      const sessionManager = getSessionManager();
+      sessionManager.stop();
+
+      // Clear session data
       await auth.signOut();
       localStorage.removeItem('userData');
+
+      // Redirect to login
       router.push('/login');
     };
 
