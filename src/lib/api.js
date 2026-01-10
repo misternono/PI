@@ -112,15 +112,15 @@ const delay = (ms = 300) => new Promise(resolve => setTimeout(resolve, ms));
 // Helper function to simulate API calls
 const mockApiCall = async (endpoint, options = {}) => {
   await delay();
-  
+
   // This is where you would make real API calls
   // For now, we'll use the mock store
   console.log(`[MOCK API] ${options.method || 'GET'} ${endpoint}`, options.body ? JSON.parse(options.body) : '');
-  
+
   // In production, this would be:
   // const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
   // return await response.json();
-  
+
   return { success: true };
 };
 
@@ -181,9 +181,9 @@ export const auth = {
       mockStore.users.push(newUser);
 
       const session = {
-        user: { 
-          id: newUser.id, 
-          email: newUser.email 
+        user: {
+          id: newUser.id,
+          email: newUser.email
         },
         access_token: 'mock-token-' + newUser.id
       };
@@ -191,12 +191,12 @@ export const auth = {
       mockStore.session = session;
       localStorage.setItem('session', JSON.stringify(session));
 
-      return { 
-        data: { 
-          user: session.user, 
-          session 
-        }, 
-        error: null 
+      return {
+        data: {
+          user: session.user,
+          session
+        },
+        error: null
       };
     } catch (error) {
       return { data: null, error };
@@ -235,9 +235,9 @@ export const auth = {
       const sessionStr = localStorage.getItem('session');
       const session = sessionStr ? JSON.parse(sessionStr) : null;
 
-      return { 
-        user: session?.user || null, 
-        error: null 
+      return {
+        user: session?.user || null,
+        error: null
       };
     } catch (error) {
       return { user: null, error };
@@ -259,7 +259,7 @@ export const auth = {
     return {
       data: {
         subscription: {
-          unsubscribe: () => {}
+          unsubscribe: () => { }
         }
       }
     };
@@ -290,18 +290,18 @@ export const db = {
       await mockApiCall(`/users/${userId}/profile`);
 
       const user = mockStore.users.find(u => u.id === userId);
-      
+
       if (!user) {
         return { data: null, error: { message: 'User not found' } };
       }
 
-      return { 
+      return {
         data: {
           id: user.id,
           full_name: user.full_name,
           role: user.role
-        }, 
-        error: null 
+        },
+        error: null
       };
     } catch (error) {
       return { data: null, error };
@@ -455,7 +455,7 @@ export const db = {
         };
       }
 
-      // Map decrypted medical data to records
+      // Map decrypted medical data and keys to records
       const decryptedDataMap = new Map();
       if (decryptedResponse?.records) {
         decryptedResponse.records.forEach(item => {
@@ -470,7 +470,13 @@ export const db = {
           } catch (error) {
             console.error('Failed to parse medical data for record', item.id, error);
           }
-          decryptedDataMap.set(item.id, medicalData);
+
+          // Store both medical data and the decrypted AES key
+          decryptedDataMap.set(item.id, {
+            ...medicalData,
+            // Capture decrypted AES key if present in the response
+            aesKey: item.aesKey || item.decryptedKey || item.key
+          });
         });
       }
 
@@ -488,6 +494,8 @@ export const db = {
           treatment: decryptedData.treatment || '',
           notes: decryptedData.notes || '',
           reason: decryptedData.reason || '',
+          aesKey: decryptedData.aesKey, // Include the decrypted AES key if available (though unlikely)
+          encryptedAESKey: record.encryptedKey, // Include the original encrypted AES key
           created_at: record.createdAt,
           doctor: record.doctor ? {
             id: record.doctor.id,
@@ -523,7 +531,7 @@ export const db = {
           const doctor = mockStore.doctors.find(d => d.id === prescription.doctor_id);
           const doctorUser = doctor ? mockStore.users.find(u => u.id === doctor.user_id) : null;
           const medications = mockStore.medications.filter(m => m.prescription_id === prescription.id);
-          
+
           return {
             ...prescription,
             doctor: doctor ? {
@@ -551,7 +559,7 @@ export const db = {
         .map(visit => {
           const doctor = mockStore.doctors.find(d => d.id === visit.doctor_id);
           const doctorUser = doctor ? mockStore.users.find(u => u.id === doctor.user_id) : null;
-          
+
           return {
             ...visit,
             doctor: doctor ? {
@@ -596,14 +604,53 @@ export const db = {
       // Encrypt the medical data
       const encryptedDescription = encryptData(medicalData, aesKey);
 
+      // Fetch public keys for patient and doctor
+      console.log('[Log] Fetching public keys for patient and doctor...');
+      const userIds = [recordData.patient_user_id, userData.id].join(',');
+      const { data: publicKeysData, error: publicKeysError } = await get(`/api/Users/publickeys?userIds=${userIds}`);
+
+      if (publicKeysError) {
+        console.error('[Error] Failed to fetch public keys:', publicKeysError);
+        return { data: null, error: publicKeysError };
+      }
+
+      // Encrypt AES key with all public keys locally
+      let encryptedKeys = [];
+
+      if (wsDecryptionService.isServiceConnected() && publicKeysData && publicKeysData.length > 0) {
+        try {
+          console.log(`[Log] Encrypting AES key with ${publicKeysData.length} public keys...`);
+
+          // Extract just the public key strings from the response
+          const publicKeyStrings = publicKeysData.map(pk => pk.publicKey);
+
+          // Batch encrypt the AES key with all public keys
+          const encryptedAesKeys = await wsDecryptionService.batchEncryptAESKey(aesKey, publicKeyStrings);
+
+          console.log('[Log] AES key encrypted successfully for all users');
+
+          // Map encrypted keys back to user IDs (keep as base64 strings for JSON serialization)
+          encryptedKeys = publicKeysData.map((pkData, index) => ({
+            userId: pkData.userId,
+            encryptedAESKey: encryptedAesKeys[index]  // Send as base64 string, .NET will convert to byte[]
+          }));
+        } catch (error) {
+          console.warn('[Warning] Could not encrypt AES key locally:', error.message);
+          console.log('[Log] Falling back to backend encryption');
+          // encryptedKeys remains empty, backend will handle encryption
+        }
+      } else {
+        console.log('[Log] Desktop app not connected, backend will handle encryption');
+      }
+
       // Prepare API request payload
       const payload = {
+        date: recordData.visit_date,
         encryptedDescription: encryptedDescription,
         encryptedPdfData: '',
         patientUserId: recordData.patient_user_id,
         doctorUserId: userData.id,
-        encryptedKeys: [],
-        aesKey: aesKey
+        encryptedKeys: encryptedKeys
       };
 
       console.log('[Log] Enviando al servidor...');
@@ -731,7 +778,7 @@ export const db = {
       });
 
       const index = mockStore.patients.findIndex(p => p.id === patientId);
-      
+
       if (index === -1) {
         return { data: null, error: { message: 'Patient not found' } };
       }
@@ -751,7 +798,7 @@ export const db = {
     try {
       await mockApiCall(`/patients/search?q=${encodeURIComponent(searchTerm)}`);
 
-      const filtered = mockStore.patients.filter(patient => 
+      const filtered = mockStore.patients.filter(patient =>
         patient.phone?.toLowerCase().includes(searchTerm.toLowerCase())
       );
 

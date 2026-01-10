@@ -88,7 +88,7 @@
             >
               <div class="record-header-line">
                 <div class="record-date">{{ formatDate(record.visit_date) }}</div>
-                <div class="record-doctor">
+                <div v-if="record.encryptedAESKey" class="record-doctor">
                   Dr. {{ record.doctor?.profiles?.full_name || 'No especificado' }}
                   <span class="doctor-specialty">{{ record.doctor?.specialty }}</span>
                 </div>
@@ -102,22 +102,33 @@
                 Compartir con Especialista
               </button>
               <div class="record-content">
-                <div class="record-field">
-                  <strong>Diagnóstico:</strong>
-                  <p>{{ record.diagnosis }}</p>
+                <div v-if="!record.encryptedAESKey" class="hidden-record">
+                  <div class="hidden-icon">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                  </div>
+                  <p>Expediente médico protegido (Contenido Oculto)</p>
                 </div>
-                <div class="record-field">
-                  <strong>Síntomas:</strong>
-                  <p>{{ record.symptoms || 'No especificados' }}</p>
-                </div>
-                <div class="record-field">
-                  <strong>Tratamiento:</strong>
-                  <p>{{ record.treatment || 'No especificado' }}</p>
-                </div>
-                <div v-if="record.notes" class="record-field">
-                  <strong>Notas:</strong>
-                  <p>{{ record.notes }}</p>
-                </div>
+                <template v-else>
+                  <div class="record-field">
+                    <strong>Diagnóstico:</strong>
+                    <p>{{ record.diagnosis }}</p>
+                  </div>
+                  <div class="record-field">
+                    <strong>Síntomas:</strong>
+                    <p>{{ record.symptoms || 'No especificados' }}</p>
+                  </div>
+                  <div class="record-field">
+                    <strong>Tratamiento:</strong>
+                    <p>{{ record.treatment || 'No especificado' }}</p>
+                  </div>
+                  <div v-if="record.notes" class="record-field">
+                    <strong>Notas:</strong>
+                    <p>{{ record.notes }}</p>
+                  </div>
+                </template>
               </div>
             </div>
           </div>
@@ -244,6 +255,8 @@ import { ref, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import Header from '../components/Header.vue';
 import { db } from '../lib/api';
+import { get, post } from '../lib/apiService';
+import { wsDecryptionService } from '../lib/wsDecryptionService';
 
 export default {
   name: 'PatientRecords',
@@ -263,12 +276,7 @@ export default {
     const selectedRecord = ref(null);
     const selectedDoctorId = ref('');
     const shareNotes = ref('');
-    const availableDoctors = ref([
-      { id: 'd1', full_name: 'María García', specialty: 'Medicina General' },
-      { id: 'd2', full_name: 'Carlos Rodríguez', specialty: 'Cardiología' },
-      { id: 'd3', full_name: 'Ana Martínez', specialty: 'Pediatría' },
-      { id: 'd4', full_name: 'Luis Hernández', specialty: 'Neurología' },
-    ]);
+    const availableDoctors = ref([]);
 
     const formatDate = (dateString) => {
       const date = new Date(dateString);
@@ -315,9 +323,37 @@ export default {
       router.push(`/staff/patient/${route.params.id}/create-record`);
     };
 
-    const openShareModal = (record) => {
+    const loadDoctors = async () => {
+      const { data: doctorsData, error } = await get('/api/Users/doctors');
+
+      if (!error && doctorsData) {
+        // Get current user ID to exclude from list
+        const userDataStr = localStorage.getItem('userData');
+        const currentUserId = userDataStr ? JSON.parse(userDataStr).id : null;
+
+        // Transform API response and filter out current user
+        availableDoctors.value = doctorsData
+          .filter(doctor => doctor.id !== currentUserId)
+          .map(doctor => ({
+            id: doctor.id,
+            full_name: `${doctor.firstName} ${doctor.lastName}`,
+            specialty: doctor.specialty || 'No especificada',
+            email: doctor.email
+          }));
+        console.log('[Log] Loaded doctors (excluding current user):', availableDoctors.value);
+      } else {
+        console.error('[Error] Failed to load doctors:', error);
+      }
+    };
+
+    const openShareModal = async (record) => {
       selectedRecord.value = record;
       showShareModal.value = true;
+
+      // Load doctors when modal opens if not already loaded
+      if (availableDoctors.value.length === 0) {
+        await loadDoctors();
+      }
     };
 
     const closeShareModal = () => {
@@ -328,15 +364,106 @@ export default {
     };
 
     const shareRecord = async () => {
-      if (!selectedDoctorId.value) return;
+      if (!selectedDoctorId.value || !selectedRecord.value) return;
 
-      const doctor = availableDoctors.value.find(d => d.id === selectedDoctorId.value);
+      try {
+        const doctor = availableDoctors.value.find(d => d.id === selectedDoctorId.value);
+        const recordId = selectedRecord.value.id;
 
-      // Here you would make an API call to share the record
-      // For now, we'll just simulate it
-      alert(`Expediente compartido exitosamente con Dr. ${doctor.full_name} (${doctor.specialty})`);
+        console.log('[Log] Sharing medical record with doctor...');
 
-      closeShareModal();
+        // Step 1: Get the target doctor's public key
+        console.log(`[Log] Fetching public key for doctor ${selectedDoctorId.value}...`);
+        const { data: publicKeysData, error: publicKeyError } = await get(`/api/Users/publickeys?userIds=${selectedDoctorId.value}`);
+
+        if (publicKeyError || !publicKeysData || publicKeysData.length === 0) {
+          console.error('[Error] Failed to fetch public key:', publicKeyError);
+          alert('Error: No se pudo obtener la clave pública del doctor');
+          return;
+        }
+
+        const targetDoctorPublicKey = publicKeysData[0].publicKey;
+        console.log('[Log] Public key fetched successfully');
+
+        // Step 2: Get the ENCRYPTED AES key from the selected record
+        // The record should have the encrypted AES key from the API
+        let encryptedRecordKey = selectedRecord.value.encryptedAESKey;
+
+        if (!encryptedRecordKey) {
+          console.log('[Log] Encrypted AES key not found in current record, attempting to refresh data...');
+          
+          // Try to fetch records again to get the data
+          const patientId = patient.value.id || route.params.id;
+          const { data: updatedRecords, error: refreshError } = await db.getPatientMedicalRecords(patientId);
+          
+          if (!refreshError && updatedRecords) {
+            const updatedRecord = updatedRecords.find(r => r.id === recordId);
+            if (updatedRecord && updatedRecord.encryptedAESKey) {
+              encryptedRecordKey = updatedRecord.encryptedAESKey;
+              console.log('[Log] Encrypted AES key retrieved after refresh');
+              
+              // Update local state
+              const recordIndex = medicalRecords.value.findIndex(r => r.id === recordId);
+              if (recordIndex !== -1) {
+                medicalRecords.value[recordIndex] = updatedRecord;
+              }
+              selectedRecord.value = updatedRecord;
+            }
+          }
+        }
+
+        if (!encryptedRecordKey) {
+          console.error('[Error] No encrypted AES key found in medical record');
+          alert('Error: No se encontró la clave cifrada del expediente.');
+          return;
+        }
+
+        // Step 3: Re-encrypt the AES key with the target doctor's public key
+        // We ask the WS to decrypt our copy (using our private key) and encrypt for the target (using their public key)
+        console.log('[Log] Requesting AES key re-encryption for target doctor...');
+        const reEncryptedKey = await wsDecryptionService.reEncryptAESKey(encryptedRecordKey, targetDoctorPublicKey);
+
+        if (!reEncryptedKey) {
+          console.error('[Error] Failed to re-encrypt AES key');
+          alert('Error: No se encontró la clave cifrada para el doctor destino');
+          return;
+        }
+
+        const encryptedAESKey = reEncryptedKey;
+        console.log('[Log] AES key re-encrypted successfully');
+
+        // Step 4: Get current user ID
+        const userDataStr = localStorage.getItem('userData');
+        const currentUserId = userDataStr ? JSON.parse(userDataStr).id : null;
+
+        if (!currentUserId) {
+          console.error('[Error] Current user not found');
+          alert('Error: Usuario no autenticado');
+          return;
+        }
+
+        // Step 5: Call the share endpoint
+        console.log('[Log] Sharing medical record via API...');
+        const { data, error } = await post(`/api/MedicalRecords/${recordId}/share`, {
+          requestingUserId: currentUserId,
+          targetDoctorUserId: selectedDoctorId.value,
+          encryptedAESKey: encryptedAESKey
+        });
+
+        if (error) {
+          console.error('[Error] Failed to share medical record:', error);
+          alert('Error al compartir el expediente médico');
+          return;
+        }
+
+        console.log('[Log] Medical record shared successfully');
+        alert(`Expediente compartido exitosamente con Dr. ${doctor.full_name}`);
+        closeShareModal();
+
+      } catch (error) {
+        console.error('[Error] Exception while sharing medical record:', error);
+        alert('Error inesperado al compartir el expediente: ' + error.message);
+      }
     };
 
     onMounted(() => {
@@ -910,5 +1037,24 @@ export default {
   .modal-footer button {
     width: 100%;
   }
+}
+
+.hidden-record {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 24px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  color: #64748b;
+  font-style: italic;
+  justify-content: center;
+}
+
+.hidden-record .hidden-icon {
+  color: #94a3b8;
+  display: flex;
+  align-items: center;
 }
 </style>
