@@ -340,37 +340,52 @@ class WSDecryptionService {
       await this.connect();
     }
 
-    return new Promise((resolve, reject) => {
-      // Set callback for when KEYS: message is received
-      this.batchEncryptedKeysCallback = resolve;
+    const allEncryptedKeys = [];
 
-      // Send command and then the data
-      const command = 'BATCHENCRYPTAESKEY';
-      const batchData = JSON.stringify({
-        aesKey: aesKey,
-        publicKeys: publicKeys
-      });
+    // Process each public key individually
+    // This resolves the issue with large JSON payloads by sending one small request per key
+    for (let i = 0; i < publicKeys.length; i++) {
+      const publicKey = publicKeys[i];
 
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        console.log(`Requesting batch AES key encryption from WSS (${publicKeys.length} keys)`);
-        this.ws.send(command);
-        // Send batch data immediately after command
-        this.ws.send(batchData);
-      } else {
-        // Queue if not connected
-        this.messageQueue.push(command);
-        this.messageQueue.push(batchData);
-        this.connect().catch(reject);
-      }
+      try {
+        const singleKeyResult = await new Promise((resolve, reject) => {
+          this.batchEncryptedKeysCallback = resolve;
 
-      // Timeout after 30 seconds
-      setTimeout(() => {
-        if (this.batchEncryptedKeysCallback === resolve) {
-          this.batchEncryptedKeysCallback = null;
-          reject(new Error('Batch AES key encryption request timeout'));
+          const command = 'BATCHENCRYPTAESKEY';
+          // Wrap singular key in array as the endpoint expects an array
+          const payload = JSON.stringify({
+            aesKey: aesKey,
+            publicKeys: [publicKey]
+          });
+
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            console.log(`Requesting AES encryption for key ${i + 1}/${publicKeys.length}`);
+            this.ws.send(command);
+            this.ws.send(payload);
+          } else {
+            reject(new Error('WebSocket connection lost'));
+          }
+
+          setTimeout(() => {
+            if (this.batchEncryptedKeysCallback === resolve) {
+              this.batchEncryptedKeysCallback = null;
+              reject(new Error('Encryption request timeout'));
+            }
+          }, 10000);
+        });
+
+        if (Array.isArray(singleKeyResult) && singleKeyResult.length > 0) {
+          allEncryptedKeys.push(singleKeyResult[0]);
+        } else {
+          throw new Error('Received empty response from encryption service');
         }
-      }, 30000);
-    });
+      } catch (error) {
+        console.error(`Failed to encrypt key index ${i}:`, error);
+        throw error; // Fail the entire batch if one fails to ensure integrity
+      }
+    }
+
+    return allEncryptedKeys;
   }
 
   /**
